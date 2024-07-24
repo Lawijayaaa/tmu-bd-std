@@ -9,6 +9,8 @@ from requests.exceptions import Timeout
 from tkinter import *
 from openpyxl import *
 
+os.chdir('/home/pi/tmu-v1-hermatic/')
+
 #init value
 engineName = "Trafo X"
 teleURL = 'http://192.168.4.120:1444/api/transformer/sendNotificationToTelegramGroup'
@@ -24,6 +26,7 @@ eddyLosesGroup = 0.02 #See table Eddy Current Group
 progStat = True
 CTratio = 1
 PTratio = 1
+CTPTratio = PTratio * CTratio
 
 #init tkinter
 screen = Tk()
@@ -41,9 +44,9 @@ screen.configure(background = "#17C0EB")
 
 #init logger
 ts = time.strftime("%Y%m%d")
-logName = r'/home/pi/tmu/tmu-bd-std/assets/datalog/sysdata/syslog-' + ts + '.log'
+logName = r'/home/pi/tmu/tmu-app-client-deploy/assets/datalog/sysdata/syslog-' + ts + '.log'
 logging.basicConfig(filename=logName, format='(asctime)s | %(levelname)s: %(message)s',level=logging.INFO)
-pathDatLog = r'/home/pi/tmu/tmu-bd-std/assets/datalog/rawdata/datalogger-' + ts + '.xlsx'
+pathDatLog = r'/home/pi/tmu/tmu-app-client-deploy/assets/datalog/rawdata/datalogger-' + ts + '.xlsx'
 sheetName = ["Harmonic_phR","Harmonic_phS", "Harmonic_phT"]
 
 #create datalog
@@ -83,7 +86,7 @@ except:
         wb.save(pathDatLog)
 
 #init modbus device, db
-client = ModbusSerialClient(method='rtu', port='/dev/ttyUSB0', baudrate=19200, timeout=2)
+client = ModbusSerialClient(method='rtu', port='/dev/ttyACM0', baudrate=9600)
 db = mysql.connector.connect(
     host = "localhost",
     user = "client",
@@ -96,7 +99,6 @@ sql0 = "SELECT * FROM transformer_data"
 cursor0.execute(sql0)
 initData = cursor0.fetchall()[0]
 suddenState = initData[29]
-lastPosition = [initData[30], initData[31]] #GPS
 
 #pre-init used Var    
 windTemp = [29.0, 28.0, 31.0]
@@ -129,27 +131,29 @@ def plcHandler(getPLC):
         plcData[0] = (round(((plcData[0] - 192.324)/769.296)*100))/100 #Pressure Calibration
     return plcData
 
-def dataHandler(getTemp, getElect1, getElect2, getElect3, getHarmV, getHarmA, currentResult, CTratio):
+def dataHandler(getTemp, getOil, getElect1, getElect2, getElect3, getHarmV, getHarmA, currentResult, CTratio, PTratio):
     try:
-        currentResult[0:4] = [member/10 for member in getTemp.registers] #Oil Temp
-        for i in range(0, 4):
+        currentResult[0] = (round(((0.195 * getOil.registers[0]) - 37.5)*100))/100 #oiltemp
+        currentResult[1:4] = [member/10 for member in getTemp.registers] #bustemp
+        for i in range(1, 4):
             if currentResult[i]>240:
                 currentResult[i] = 0
+        print(currentResult[0:4])
     except:
         pass
     try:
         for i in range(0,3):
-            currentResult[(i*9)+6] = (getElect1.registers[i])/100
-            currentResult[(i*9)+7] = (getElect1.registers[i+3])/100
+            currentResult[(i*9)+6] = PTratio * ((getElect1.registers[i])/100)
+            currentResult[(i*9)+7] = PTratio * ((getElect1.registers[i+3])/100)
             currentResult[(i*9)+8] = (CTratio * getElect1.registers[i+6])/1000
 
             currentResult[(i*9)+9] = (signedInt16Handler(getElect1.registers[i+21]))/1000
-            currentResult[(i*9)+10] = (CTratio * signedInt16Handler(getElect1.registers[i+15]))/10
-            currentResult[(i*9)+11] = (CTratio * signedInt16Handler(getElect1.registers[i+18]))/10
+            currentResult[(i*9)+10] = (CTPTratio * signedInt16Handler(getElect1.registers[i+15]))/10
+            currentResult[(i*9)+11] = (CTPTratio * signedInt16Handler(getElect1.registers[i+18]))/10
 
         currentResult[39] = (CTratio * getElect1.registers[9])/1000
-        currentResult[35] = ((CTratio * signedInt32Handler(getElect1.registers[10:12]))[0])/10
-        currentResult[36] = ((CTratio * signedInt32Handler(getElect1.registers[12:14]))[0])/10
+        currentResult[35] = ((CTPTratio * signedInt32Handler(getElect1.registers[10:12]))[0])/10
+        currentResult[36] = ((CTPTratio * signedInt32Handler(getElect1.registers[12:14]))[0])/10
         currentResult[34] = (getElect1.registers[14])/1000
         currentResult[38] = (getElect1.registers[24])/100
         currentResult[40] = (unsignedInt32Handler(getElect1.registers[25:27]))/10
@@ -205,7 +209,7 @@ def Restart():
     global wb
     wb.save(pathDatLog)
     logging.info("Restart")
-    os.execv(sys.executable, [sys.executable] + ['IoT_Trafo_Project.py'])
+    os.execv(sys.executable, [sys.executable] + ['/home/pi/tmu-v1-hermatic/IoT_Trafo_Project.py'])
 
 def Start():
     global progStat
@@ -309,8 +313,9 @@ def mainLoop(thread_name, interval):
             else:
                 activeParam[0] = None     
             logging.info("D07 get data from ModBus Devices")
-            getTemp = client.read_holding_registers(0, 4, slave = 7)
+            getTemp = client.read_holding_registers(0, 3, slave = 7)
             getPLC = client.read_holding_registers(55, 4, slave = 1)
+            getOil = client.read_holding_registers(54, 1, slave = 1)
             getElect1 = client.read_holding_registers(0, 29, slave = 2)
             getElect2 = client.read_holding_registers(46, 5, slave = 2)
             getElect3 = client.read_holding_registers(800, 6, slave = 2)
@@ -319,7 +324,7 @@ def mainLoop(thread_name, interval):
             logging.info("D08 Handling received data")
             plcResult = [0]*5
             try:
-                newResult = dataHandler(getTemp, getElect1, getElect2, getElect3, getHarmV, getHarmA, currentResult, CTratio)
+                newResult = dataHandler(getTemp, getOil, getElect1, getElect2, getElect3, getHarmV, getHarmA, currentResult, CTratio, PTratio)
                 plcResult = plcHandler(getPLC)
                 if plcResult[4] == 500:
                     newResult[0][4:6] = plcResult[0:2]
